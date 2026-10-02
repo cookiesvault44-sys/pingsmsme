@@ -171,20 +171,36 @@ def login_to_portal():
 # ---------------------------------------------------------------- DATA FETCH
 def build_params(portal_filters=None):
     now = datetime.now()
-    # wide date range in case the portal's timezone differs from yours
-    d1 = (now - timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")
-    d2 = (now + timedelta(days=1)).strftime("%Y-%m-%d 23:59:59")
-
-    # Filters coming from the extension -> portal's own filter fields
-    # (number->fnum, cli->fcli, date->fgdate, month->fgmonth). Date ranges
-    # are additionally enforced locally in row_passes_filters().
     pf = portal_filters or {}
+
+    # Date window for the portal fetch. Widened when the user filters by an
+    # explicit date/month/range so older rows are included; otherwise a wide
+    # +-1 day window (the portal clock may differ from ours).
+    # NOTE: number/cli/month filters are applied LOCALLY in row_passes_filters()
+    # only -- the portal's own fnum/fcli fields use different value formats
+    # (e.g. they don't know "Royal Canin"), so passing ours would wrongly
+    # return zero rows.
+    if pf.get("date"):
+        d1 = pf["date"] + " 00:00:00"
+        d2 = pf["date"] + " 23:59:59"
+    elif pf.get("month"):
+        import calendar
+        y, m = pf["month"].split("-")[:2]
+        last = calendar.monthrange(int(y), int(m))[1]
+        d1 = f"{pf['month']}-01 00:00:00"
+        d2 = f"{pf['month']}-{last:02d} 23:59:59"
+    elif pf.get("start") or pf.get("end"):
+        d1 = (pf.get("start") or "2000-01-01") + " 00:00:00"
+        d2 = (pf.get("end") or now.strftime("%Y-%m-%d")) + " 23:59:59"
+    else:
+        d1 = (now - timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")
+        d2 = (now + timedelta(days=1)).strftime("%Y-%m-%d 23:59:59")
 
     # FIX: Removed ALL trailing spaces from dictionary keys and values
     params = {
         "fdate1": d1, "fdate2": d2,
-        "frange": "", "fnum": pf.get("number", ""), "fcli": pf.get("cli", ""),
-        "fgdate": pf.get("date", ""), "fgmonth": pf.get("month", ""), "fgrange": "",
+        "frange": "", "fnum": "", "fcli": "",
+        "fgdate": "", "fgmonth": "", "fgrange": "",
         "fgnumber": "", "fgcli": "", "fg": 0,
         "sEcho": 1, "iColumns": 7, "sColumns": ",,,,,,",
         "iDisplayStart": 0, "iDisplayLength": 500,
