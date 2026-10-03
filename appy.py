@@ -624,7 +624,9 @@ def stats():
     rows = fetch_rows(username, password, portal_filters=f)
     if rows is None:
         return jsonify({"error": "Failed to log into SMS portal"}), 500
-    return jsonify(compute_stats(rows, request.args.get("alnum") == "1", f))
+    result = compute_stats(rows, request.args.get("alnum") == "1", f)
+    result["portal_user"] = username
+    return jsonify(result)
 
 
 @app.route("/messages", methods=["GET"])
@@ -710,6 +712,7 @@ def payout():
         "per_country": breakdown,
         "total_sms": total_sms,
         "grand_total": round(grand, 2),
+        "portal_user": username,
     }), 200
 
 if __name__ == "__main__":
