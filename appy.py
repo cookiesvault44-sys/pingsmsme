@@ -324,14 +324,25 @@ PAYOUT_RATES = {
     "Algeria": 1.7,
 }
 
+# Route codes the portal uses, mapped to countries (labels vary wildly, e.g.
+# 'Palestine-M4-06' vs 'M406'). The user confirmed M406/M606 are Palestine routes.
+ROUTE_CODE_COUNTRY = {
+    "m406": "Palestine",
+    "m606": "Palestine",
+}
+
 def country_of(cells, number):
-    """Country from the portal's route label (col 1, e.g. 'Palestine-M4-06'),
-    falling back to the number's country prefix."""
-    if len(cells) > 1:
-        route = str(cells[1]).strip()
-        first = route.split("-")[0].strip().lower()
+    """Country from the portal's route label (col 1). The label format varies
+    ('Palestine-M4-06', 'M406-Palestine', ...), so the WHOLE label is searched
+    for a known country name or route code — every route of a country uses
+    that country's rate. Falls back to the number's country prefix."""
+    route = str(cells[1]).strip().lower() if len(cells) > 1 else ""
+    if route:
         for c in PAYOUT_RATES:
-            if c.lower() == first:
+            if c.lower() in route:
+                return c
+        for code, c in ROUTE_CODE_COUNTRY.items():
+            if code in route:
                 return c
     if number:
         if number.startswith("+972") or number.startswith("+970"):
@@ -478,6 +489,7 @@ def parse_row(row, alnum=False):
     return {
         "number": number,
         "country": country_of(cells, number),
+        "route": str(cells[1]).strip() if len(cells) > 1 else "",
         "cli": detect_cli(cells),
         "code": extract_otp(message, alnum),
         "text": message,
@@ -724,12 +736,17 @@ def payout():
         return jsonify({"error": "Failed to log into SMS portal"}), 500
     per_country = {}
     total_sms = 0
+    unknown_sms = 0
+    unknown_routes = {}
     for row in rows:
         p = parse_row(row)
         if not p or not p["number"]:
             continue
         c = p.get("country") or "Other"
         if c not in PAYOUT_RATES:
+            unknown_sms += 1
+            rl = p.get("route") or "?"
+            unknown_routes[rl] = unknown_routes.get(rl, 0) + 1
             continue
         per_country[c] = per_country.get(c, 0) + 1
         total_sms += 1
@@ -746,6 +763,9 @@ def payout():
         "total_sms": total_sms,
         "grand_total": round(grand, 2),
         "portal_user": username,
+        "unknown_sms": unknown_sms,
+        "unknown_routes": dict(sorted(unknown_routes.items(),
+                                      key=lambda kv: -kv[1])[:10]),
     }), 200
 
 if __name__ == "__main__":
