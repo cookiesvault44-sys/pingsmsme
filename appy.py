@@ -203,7 +203,7 @@ def login_to_portal(session, username, password):
         return False
 
 # ---------------------------------------------------------------- DATA FETCH
-def build_params(portal_filters=None):
+def build_params(portal_filters=None, display_start=0, display_length=500):
     now = datetime.now()
     pf = portal_filters or {}
 
@@ -237,7 +237,7 @@ def build_params(portal_filters=None):
         "fgdate": "", "fgmonth": "", "fgrange": "",
         "fgnumber": "", "fgcli": "", "fg": 0,
         "sEcho": 1, "iColumns": 7, "sColumns": ",,,,,,",
-        "iDisplayStart": 0, "iDisplayLength": 500,
+        "iDisplayStart": display_start, "iDisplayLength": display_length,
         "sSearch": "", "bRegex": "false",
         "iSortCol_0": 0, "sSortDir_0": "desc", "iSortingCols": 1,
         "_": int(now.timestamp() * 1000),
@@ -250,11 +250,13 @@ def build_params(portal_filters=None):
         })
     return params
 
-def fetch_rows(username, password, portal_filters=None):
+def fetch_rows(username, password, portal_filters=None, display_start=0,
+               display_length=500):
     """
-    Return SMS rows (list of lists) from the AJAX endpoint, using the portal
-    session that belongs to `username`. Logs in again if the session expired.
-    Returns None if login fails.
+    Return one page of SMS rows (list of lists) from the AJAX endpoint, using
+    the portal session that belongs to `username`. Logs in again if the
+    session expired. Returns None if login fails.
+    Use fetch_all_rows() to collect every page.
     """
     headers = {
         "X-Requested-With": "XMLHttpRequest",
@@ -270,7 +272,7 @@ def fetch_rows(username, password, portal_filters=None):
                 session.get(INBOX_URL, timeout=10)
                 
                 print(f"[DEBUG] Fetching data from AJAX endpoint...")
-                r = session.get(DATA_URL, params=build_params(portal_filters), headers=headers, timeout=15)
+                r = session.get(DATA_URL, params=build_params(portal_filters, display_start, display_length), headers=headers, timeout=15)
                 
                 print(f"[DEBUG] Response Status: {r.status_code}")
                 
@@ -298,7 +300,30 @@ def fetch_rows(username, password, portal_filters=None):
                 else:
                     print("[ERROR] Max retries reached. Giving up.")
                     return None
-        return None
+
+
+def fetch_all_rows(username, password, portal_filters=None, page_size=500,
+                   max_pages=20):
+    """Collect EVERY portal row by paging (iDisplayStart offsets).
+
+    The portal caps a single response at page_size rows, so reading only the
+    first page silently undercounts (e.g. 500 shown instead of 842).
+    Returns None if login fails.
+    """
+    all_rows = []
+    start = 0
+    for _ in range(max_pages):
+        rows = fetch_rows(username, password, portal_filters,
+                           display_start=start, display_length=page_size)
+        if rows is None:
+            return None
+        if not rows:
+            break
+        all_rows.extend(rows)
+        if len(rows) < page_size:
+            break
+        start += page_size
+    return all_rows
 
 # ---------------------------------------------------------------- OTP PARSING
 ALNUM_TOKEN = re.compile(r"(?<![\w/@.])([A-Za-z0-9]{4,8})(?![\w@/]|\.\w)")
@@ -654,7 +679,7 @@ def stats():
         return err
     username, password = creds
     f = get_request_filters(request.args)
-    rows = fetch_rows(username, password, portal_filters=f)
+    rows = fetch_all_rows(username, password, portal_filters=f)
     if rows is None:
         return jsonify({"error": "Failed to log into SMS portal"}), 500
     result = compute_stats(rows, request.args.get("alnum") == "1", f)
@@ -731,7 +756,7 @@ def payout():
     if err:
         return err
     username, password = creds
-    rows = fetch_rows(username, password, {"start": monday.isoformat(), "end": sunday.isoformat()})
+    rows = fetch_all_rows(username, password, {"start": monday.isoformat(), "end": sunday.isoformat()})
     if rows is None:
         return jsonify({"error": "Failed to log into SMS portal"}), 500
     per_country = {}
