@@ -100,15 +100,27 @@ def get_session(username):
             portal_sessions[username] = sess
         return sess
 
+LOGIN_REQUIRED = ("Portal login required — extension popup me apna portal "
+                    "login save karo.")
+
 def get_request_creds():
-    """Portal login for this request: X-Portal-User / X-Portal-Pass headers
-    (sent by the extension when the user logged in there), otherwise the
-    server's own env credentials."""
+    """Portal login for this request, from X-Portal-User / X-Portal-Pass
+    headers (sent by the extension when the user logged in there).
+    No headers -> (None, None): every route must reject the request.
+    There is deliberately NO silent fallback to the server env credentials,
+    so one install can never see another user's portal account."""
     user = (request.headers.get("X-Portal-User") or "").strip()
     pw = request.headers.get("X-Portal-Pass") or ""
     if user and pw:
         return user, pw
-    return USERNAME, PASSWORD
+    return None, None
+
+def require_login():
+    """Returns ((username, password), None) or (None, 401-response)."""
+    username, password = get_request_creds()
+    if not username:
+        return None, (jsonify({"error": LOGIN_REQUIRED}), 401)
+    return (username, password), None
 
 # OTP rows already returned, so an old code is never sent twice
 served_rows = {}  # (username, target_digits) -> set of row keys
@@ -513,7 +525,10 @@ def ping():
 
 @app.route("/get-otp", methods=["GET"])
 def get_otp():
-    username, password = get_request_creds()
+    creds, err = require_login()
+    if err:
+        return err
+    username, password = creds
     phone_param = request.args.get("phone", "").strip()
     target_digits = normalize_phone(phone_param)
     if not target_digits:
@@ -530,7 +545,10 @@ def get_otp():
 @app.route("/mark-seen", methods=["GET"])
 def mark_seen():
     """Call this BEFORE the SMS is requested, so old SMS for this number are ignored."""
-    username, password = get_request_creds()
+    creds, err = require_login()
+    if err:
+        return err
+    username, password = creds
     phone_param = request.args.get("phone", "").strip()
     target_digits = normalize_phone(phone_param)
     if not target_digits:
@@ -619,7 +637,10 @@ def compute_stats(rows, alnum=False, filters=None):
 def stats():
     """Total SMS + OTP count per number, for the extension's floating panel.
     Filters: ?number=&cli=&date=&month=&start=&end=  (+ alnum=1)"""
-    username, password = get_request_creds()
+    creds, err = require_login()
+    if err:
+        return err
+    username, password = creds
     f = get_request_filters(request.args)
     rows = fetch_rows(username, password, portal_filters=f)
     if rows is None:
@@ -633,7 +654,10 @@ def stats():
 def messages():
     """Flat message list with CLI + filters (portal-style view).
     Filters: ?number=&cli=&date=&month=&start=&end=  (+ alnum=1)"""
-    username, password = get_request_creds()
+    creds, err = require_login()
+    if err:
+        return err
+    username, password = creds
     f = get_request_filters(request.args)
     alnum = request.args.get("alnum") == "1"
     rows = fetch_rows(username, password, portal_filters=f)
@@ -654,7 +678,10 @@ def messages():
 def restart():
     """Soft restart: forget this user's seen rows, drop their session,
     log in again, return fresh stats."""
-    username, password = get_request_creds()
+    creds, err = require_login()
+    if err:
+        return err
+    username, password = creds
     with portal_lock:
         for key in [k for k in served_rows if k[0] == username]:
             del served_rows[key]
@@ -668,7 +695,10 @@ def restart():
 @app.route("/debug-rows", methods=["GET"])
 def debug_rows():
     """Shows the first raw rows from the portal, to check the format."""
-    username, password = get_request_creds()
+    creds, err = require_login()
+    if err:
+        return err
+    username, password = creds
     rows = fetch_rows(username, password)
     if rows is None:
         return jsonify({"error": "Failed to log into SMS portal"}), 500
@@ -685,7 +715,10 @@ def payout():
     today = (datetime.now() + timedelta(hours=TZ_OFFSET_HOURS)).date()
     monday = today - timedelta(days=today.weekday())
     sunday = monday + timedelta(days=6)
-    username, password = get_request_creds()
+    creds, err = require_login()
+    if err:
+        return err
+    username, password = creds
     rows = fetch_rows(username, password, {"start": monday.isoformat(), "end": sunday.isoformat()})
     if rows is None:
         return jsonify({"error": "Failed to log into SMS portal"}), 500
