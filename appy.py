@@ -268,30 +268,53 @@ def fetch_rows(portal_filters=None):
 ALNUM_TOKEN = re.compile(r"(?<![\w/@.])([A-Za-z0-9]{4,8})(?![\w@/]|\.\w)")
 OTP_KEYWORD = re.compile(r"otp|code|pin|verification|password|passcode", re.I)
 
-# ---------------------------------------------------------------- CLI DETECTION
-# Which service sent the SMS (Microsoft, Google, ...). Shown in the extension
-# next to the number + code, and usable as a filter.
-CLI_PATTERNS = {
-    'Microsoft': [r'microsoft', r'msft', r'azure', r'outlook'],
-    'Royal Canin': [r'royal\s*canin', r'canin'],
-    'Ticketmaster': [r'ticketmaster', r'tkmst'],
-    'Google': [r'google', r'g-', r'gmail'],
-    'WhatsApp': [r'whatsapp', r'wa-'],
-    'Telegram': [r'telegram', r't\.me'],
-    'Facebook': [r'facebook', r'fb-'],
-    'Amazon': [r'amazon', r'amzn'],
-    'Uber': [r'uber'],
-    'Apple': [r'apple'],
+# ---------------------------------------------------------------- CLI (from the portal itself)
+# The portal reports the sending service directly in column 3 of every row
+# (e.g. "TKTMASTER"). No guessing, no hardcoded list — the extension shows
+# exactly the CLIs that exist in the portal data.
+def detect_cli(cells):
+    """Sending service = portal column 3, verbatim."""
+    if len(cells) > 3:
+        sender = str(cells[3]).strip()
+        if sender:
+            return sender
+    return "Other"
+
+# ---------------------------------------------------------------- COUNTRY + PAYOUT
+# Weekly payout scheme (Monday -> Sunday): SMS count per country x rate.
+PAYOUT_RATES = {
+    "Palestine": 3.0,
+    "Philippines": 1.7,
+    "Algeria": 1.7,
 }
 
-def detect_cli(text, sender=''):
-    """Detect the sending service from message text (and sender cell if given)."""
-    combined = f"{sender} {text}".lower()
-    for cli, patterns in CLI_PATTERNS.items():
-        for pat in patterns:
-            if re.search(pat, combined):
-                return cli
-    return sender.strip().title() if sender and sender.strip() else 'Other'
+def country_of(cells, number):
+    """Country from the portal's route label (col 1, e.g. 'Palestine-M4-06'),
+    falling back to the number's country prefix."""
+    if len(cells) > 1:
+        route = str(cells[1]).strip()
+        first = route.split("-")[0].strip().lower()
+        for c in PAYOUT_RATES:
+            if c.lower() == first:
+                return c
+    if number:
+        if number.startswith("+972") or number.startswith("+970"):
+            return "Palestine"
+        if number.startswith("+63"):
+            return "Philippines"
+        if number.startswith("+213"):
+            return "Algeria"
+    return "Other"
+
+def split_number(n):
+    """'+972569290973' -> ('+972', '569290973'). Variable-length country codes."""
+    for cc in ("+972", "+970", "+63", "+213"):
+        if n.startswith(cc):
+            return cc, n[len(cc):]
+    m = re.match(r"(\+\d{1,4})", n or "")
+    if m:
+        return m.group(1), n[len(m.group(1)):]
+    return "", n or ""
 
 def extract_alnum_otp(message):
     """OTPs that mix English letters and digits (e.g. A7K9Q2). Needs >=1 digit and >=1 letter."""
@@ -418,7 +441,8 @@ def parse_row(row, alnum=False):
     message = max(texts, key=len) if texts else ""
     return {
         "number": number,
-        "cli": detect_cli(message),
+        "country": country_of(cells, number),
+        "cli": detect_cli(cells),
         "code": extract_otp(message, alnum),
         "text": message,
         "timestamp": stamp,
@@ -493,15 +517,22 @@ def mark_seen():
 
 # ---------------------------------------------------------------- STATS (floating panel)
 def extract_number(cells):
-    """Find the phone number cell of a row -> '+63XXXXXXXXXX' (masked digits kept)."""
+    """Find the phone number cell -> '+<country><national>' (972/970, 63, 213 ...)."""
     for cell in cells:
         token = re.sub(r"[\s+\-().]", "", cell)
-        if re.fullmatch(r"[\d*xX#]{9,15}", token):
-            if token.startswith("63") and len(token) >= 12:
-                token = token[2:]
-            elif token.startswith("0") and len(token) >= 11:
-                token = token[1:]
-            return "+63" + token[-10:]
+        if not re.fullmatch(r"[\d*xX#]{9,15}", token):
+            continue
+        if token.startswith("972"):
+            return "+972" + token[3:]
+        if token.startswith("970"):
+            return "+970" + token[3:]
+        if token.startswith("63") and len(token) >= 11:
+            return "+63" + token[2:]
+        if token.startswith("213"):
+            return "+213" + token[3:]
+        if token.startswith("0") and len(token) >= 10:
+            return "+63" + token[1:]   # local format -> Philippines (portal default)
+        return "+" + token
     return None
 
 # If the portal clock differs from your PC clock, set e.g. PORTAL_TZ_OFFSET_HOURS=-5
@@ -528,26 +559,31 @@ def compute_stats(rows, alnum=False, filters=None):
         if not has_date_filter and stamp and stamp[:10] != today:
             continue  # not today's SMS (unless filtering by date)
         total += 1
-        entry = data.setdefault(p["number"], [])
+        entry = data.setdefault(p["number"], {"otps": [], "countries": {}})
         if p["code"]:
-            entry.append({"otp": p["code"], "time": stamp[11:19] if stamp else "",
-                          "cli": p["cli"]})
+            entry["otps"].append({"otp": p["code"], "time": stamp[11:19] if stamp else "",
+                                  "cli": p["cli"]})
+        ctry = p.get("country") or "Other"
+        entry["countries"][ctry] = entry["countries"].get(ctry, 0) + 1
 
     numbers = []
-    for n, otps in sorted(data.items(), key=lambda kv: -len(kv[1])):
-        otps = sorted(otps, key=lambda o: o["time"], reverse=True)  # newest first
+    for n, entry in sorted(data.items(), key=lambda kv: -len(kv[1]["otps"])):
+        otps = sorted(entry["otps"], key=lambda o: o["time"], reverse=True)  # newest first
         cli_counts = {}
         for o in otps:
             cli_counts[o["cli"]] = cli_counts.get(o["cli"], 0) + 1
         top_cli = max(cli_counts, key=cli_counts.get) if cli_counts else None
+        cc, local = split_number(n)
+        top_country = max(entry["countries"], key=entry["countries"].get)
         numbers.append({
             "number": n,
-            "country_code": n[:3],       # +63
-            "local": n[3:],              # number without country code
+            "country_code": cc,          # +972 / +63 / +213 ...
+            "local": local,              # number without country code
+            "country": top_country,      # Palestine / Philippines / Algeria ...
             "otp_count": len(otps),
             "last_otp": otps[0]["otp"] if otps else None,
             "last_otp_time": otps[0]["time"] if otps else "",
-            "cli": top_cli,              # NEW: sending service for this number
+            "cli": top_cli,              # sending service for this number (portal-direct)
             "otps": otps,                # full list, newest first (each has "cli")
         })
     return {"total_sms": total, "date": f.get("date") or today, "alnum": alnum,
@@ -602,6 +638,45 @@ def debug_rows():
     if rows is None:
         return jsonify({"error": "Failed to log into SMS portal"}), 500
     return jsonify({"rows_seen": len(rows), "sample": rows[:5]})
+
+@app.route("/payout", methods=["GET"])
+def payout():
+    """Weekly payout (Monday -> Sunday): SMS count per country x rate + grand total.
+
+    Counts every portal row in the current week (each row = 1 SMS), grouped by
+    country (from the portal's route label, e.g. 'Palestine-M4-06'). When the
+    week ends the window rolls to the new Monday and the counter restarts.
+    """
+    today = (datetime.now() + timedelta(hours=TZ_OFFSET_HOURS)).date()
+    monday = today - timedelta(days=today.weekday())
+    sunday = monday + timedelta(days=6)
+    rows = fetch_rows({"start": monday.isoformat(), "end": sunday.isoformat()})
+    if rows is None:
+        return jsonify({"error": "Failed to log into SMS portal"}), 500
+    per_country = {}
+    total_sms = 0
+    for row in rows:
+        p = parse_row(row)
+        if not p or not p["number"]:
+            continue
+        c = p.get("country") or "Other"
+        if c not in PAYOUT_RATES:
+            continue
+        per_country[c] = per_country.get(c, 0) + 1
+        total_sms += 1
+    breakdown = {}
+    grand = 0.0
+    for c, count in per_country.items():
+        amount = round(count * PAYOUT_RATES[c], 2)
+        breakdown[c] = {"sms": count, "rate": PAYOUT_RATES[c], "amount": amount}
+        grand += amount
+    return jsonify({
+        "week_start": monday.isoformat(),
+        "week_end": sunday.isoformat(),
+        "per_country": breakdown,
+        "total_sms": total_sms,
+        "grand_total": round(grand, 2),
+    }), 200
 
 if __name__ == "__main__":
     # If the saved username/password turn out to be wrong, delete the bad
