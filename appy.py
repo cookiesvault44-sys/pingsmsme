@@ -78,18 +78,40 @@ USERNAME, PASSWORD = get_login()
 # Philippines numbers: national format is 10 digits starting with 9
 # (e.g. 9171234567). The portal shows them as 63 9171234567, the extension
 # may send 09171234567, +639171234567 or 9171234567. All are normalized.
-session = requests.Session()
-session.headers.update({
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    )
-})
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
 
-portal_lock = threading.Lock()
+portal_lock = threading.RLock()
+
+# One portal session per portal username, so the extension can serve several
+# portal accounts (e.g. yours and a friend's) without touching Render:
+# the extension sends X-Portal-User / X-Portal-Pass headers with each request.
+portal_sessions = {}  # portal username -> requests.Session
+
+def get_session(username):
+    """Return (creating if needed) the portal session for this username."""
+    with portal_lock:
+        sess = portal_sessions.get(username)
+        if sess is None:
+            sess = requests.Session()
+            sess.headers.update({"User-Agent": UA})
+            portal_sessions[username] = sess
+        return sess
+
+def get_request_creds():
+    """Portal login for this request: X-Portal-User / X-Portal-Pass headers
+    (sent by the extension when the user logged in there), otherwise the
+    server's own env credentials."""
+    user = (request.headers.get("X-Portal-User") or "").strip()
+    pw = request.headers.get("X-Portal-Pass") or ""
+    if user and pw:
+        return user, pw
+    return USERNAME, PASSWORD
 
 # OTP rows already returned, so an old code is never sent twice
-served_rows = {}  # target_digits -> set of row keys
+served_rows = {}  # (username, target_digits) -> set of row keys
 portal_info = {"total": None}  # total SMS count reported by the portal
 
 TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?")
@@ -133,7 +155,7 @@ def build_login_request(html):
     action = urljoin(LOGIN_URL, form.get("action") or LOGIN_URL)
     return action, payload
 
-def is_logged_in():
+def is_logged_in(session):
     """Open the inbox page; True only if we really got it (not the login page)."""
     try:
         res = session.get(INBOX_URL, timeout=10)
@@ -146,8 +168,8 @@ def is_logged_in():
         return False
     return True
 
-def login_to_portal():
-    if not USERNAME or not PASSWORD:
+def login_to_portal(session, username, password):
+    if not username or not password:
         print("Portal credentials not configured (set PORTAL_USER/PORTAL_PASS).")
         return False
     try:
@@ -161,7 +183,7 @@ def login_to_portal():
             return False
         print(f"Posting login to {action} with fields {list(payload.keys())}")
         session.post(action, data=payload, timeout=10)
-        ok = is_logged_in()
+        ok = is_logged_in(session)
         print("Login successful!" if ok else "Login failed (wrong credentials or CAPTCHA)")
         return ok
     except Exception as e:
@@ -216,16 +238,18 @@ def build_params(portal_filters=None):
         })
     return params
 
-def fetch_rows(portal_filters=None):
+def fetch_rows(username, password, portal_filters=None):
     """
-    Return SMS rows (list of lists) from the AJAX endpoint.
-    Logs in again if the session expired. Returns None if login fails.
+    Return SMS rows (list of lists) from the AJAX endpoint, using the portal
+    session that belongs to `username`. Logs in again if the session expired.
+    Returns None if login fails.
     """
     headers = {
         "X-Requested-With": "XMLHttpRequest",
         "Referer": INBOX_URL,
         "Accept": "application/json, text/javascript, */*; q=0.01"
     }
+    session = get_session(username)
     with portal_lock:
         for attempt in range(3):
             try:
@@ -256,7 +280,7 @@ def fetch_rows(portal_filters=None):
                 print(f"[ERROR] Fetch failed (attempt {attempt + 1}): {e}")
                 if attempt < 2:
                     print("[DEBUG] Attempting to re-login...")
-                    if not login_to_portal():
+                    if not login_to_portal(session, username, password):
                         print("[ERROR] Re-login failed completely.")
                         return None
                 else:
@@ -378,12 +402,12 @@ def row_matches_phone(cells, target):
     # fallback: digits-only substring over the whole row
     return target in re.sub(r"\D", "", " ".join(cells))
 
-def find_new_otp(rows, target_digits, mark_only=False):
+def find_new_otp(rows, target_digits, username="", mark_only=False):
     """
     Keep rows for this phone, skip rows already served, return the newest OTP.
     With mark_only=True, just remember all matching rows as already seen.
     """
-    seen = served_rows.setdefault(target_digits, set())
+    seen = served_rows.setdefault((username, target_digits), set())
     candidates = []
     for row in rows:
         if not isinstance(row, (list, tuple)):
@@ -489,15 +513,16 @@ def ping():
 
 @app.route("/get-otp", methods=["GET"])
 def get_otp():
+    username, password = get_request_creds()
     phone_param = request.args.get("phone", "").strip()
     target_digits = normalize_phone(phone_param)
     if not target_digits:
         return jsonify({"error": "Phone parameter required"}), 400
-    rows = fetch_rows()
+    rows = fetch_rows(username, password)
     if rows is None:
         return jsonify({"error": "Failed to log into SMS portal"}), 500
     try:
-        otp = find_new_otp(rows, target_digits)
+        otp = find_new_otp(rows, target_digits, username)
     except Exception as e:
         return jsonify({"error": f"Error parsing rows: {e}"}), 500
     return jsonify({"phone": phone_param, "otp": otp, "rows_seen": len(rows)})
@@ -505,14 +530,15 @@ def get_otp():
 @app.route("/mark-seen", methods=["GET"])
 def mark_seen():
     """Call this BEFORE the SMS is requested, so old SMS for this number are ignored."""
+    username, password = get_request_creds()
     phone_param = request.args.get("phone", "").strip()
     target_digits = normalize_phone(phone_param)
     if not target_digits:
         return jsonify({"error": "Phone parameter required"}), 400
-    rows = fetch_rows()
+    rows = fetch_rows(username, password)
     if rows is None:
         return jsonify({"error": "Failed to log into SMS portal"}), 500
-    find_new_otp(rows, target_digits, mark_only=True)
+    find_new_otp(rows, target_digits, username, mark_only=True)
     return jsonify({"phone": phone_param, "marked": True})
 
 # ---------------------------------------------------------------- STATS (floating panel)
@@ -593,8 +619,9 @@ def compute_stats(rows, alnum=False, filters=None):
 def stats():
     """Total SMS + OTP count per number, for the extension's floating panel.
     Filters: ?number=&cli=&date=&month=&start=&end=  (+ alnum=1)"""
+    username, password = get_request_creds()
     f = get_request_filters(request.args)
-    rows = fetch_rows(portal_filters=f)
+    rows = fetch_rows(username, password, portal_filters=f)
     if rows is None:
         return jsonify({"error": "Failed to log into SMS portal"}), 500
     return jsonify(compute_stats(rows, request.args.get("alnum") == "1", f))
@@ -604,9 +631,10 @@ def stats():
 def messages():
     """Flat message list with CLI + filters (portal-style view).
     Filters: ?number=&cli=&date=&month=&start=&end=  (+ alnum=1)"""
+    username, password = get_request_creds()
     f = get_request_filters(request.args)
     alnum = request.args.get("alnum") == "1"
-    rows = fetch_rows(portal_filters=f)
+    rows = fetch_rows(username, password, portal_filters=f)
     if rows is None:
         return jsonify({"error": "Failed to log into SMS portal"}), 500
     out = []
@@ -622,11 +650,15 @@ def messages():
 
 @app.route("/restart", methods=["GET"])
 def restart():
-    """Soft restart: forget seen rows, drop the session, log in again, return fresh stats."""
+    """Soft restart: forget this user's seen rows, drop their session,
+    log in again, return fresh stats."""
+    username, password = get_request_creds()
     with portal_lock:
-        served_rows.clear()
-        session.cookies.clear()
-        ok = login_to_portal()
+        for key in [k for k in served_rows if k[0] == username]:
+            del served_rows[key]
+        sess = get_session(username)
+        sess.cookies.clear()
+        ok = login_to_portal(sess, username, password)
     if not ok:
         return jsonify({"error": "Re-login to portal failed"}), 500
     return stats()
@@ -634,7 +666,8 @@ def restart():
 @app.route("/debug-rows", methods=["GET"])
 def debug_rows():
     """Shows the first raw rows from the portal, to check the format."""
-    rows = fetch_rows()
+    username, password = get_request_creds()
+    rows = fetch_rows(username, password)
     if rows is None:
         return jsonify({"error": "Failed to log into SMS portal"}), 500
     return jsonify({"rows_seen": len(rows), "sample": rows[:5]})
@@ -650,7 +683,8 @@ def payout():
     today = (datetime.now() + timedelta(hours=TZ_OFFSET_HOURS)).date()
     monday = today - timedelta(days=today.weekday())
     sunday = monday + timedelta(days=6)
-    rows = fetch_rows({"start": monday.isoformat(), "end": sunday.isoformat()})
+    username, password = get_request_creds()
+    rows = fetch_rows(username, password, {"start": monday.isoformat(), "end": sunday.isoformat()})
     if rows is None:
         return jsonify({"error": "Failed to log into SMS portal"}), 500
     per_country = {}
@@ -682,7 +716,7 @@ if __name__ == "__main__":
     # If the saved username/password turn out to be wrong, delete the bad
     # login.json and ask again (3 tries), instead of starting with dead creds.
     for attempt in range(3):
-        if login_to_portal():
+        if login_to_portal(get_session(USERNAME), USERNAME, PASSWORD):
             break
         print("That username/password didn't work on the portal.")
         if CONFIG_PATH.exists():
