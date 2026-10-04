@@ -136,8 +136,11 @@ def solve_math_captcha(text):
         return int(match.group(1)) + int(match.group(2))
     return None
 
-def build_login_request(html):
-    """Read the real login form so field names/action come from the site."""
+def build_login_request(html, username, password):
+    """Read the real login form so field names/action come from the site.
+
+    Uses the per-request portal credentials (NOT the server globals), so each
+    extension user really logs into the portal as themselves."""
     soup = BeautifulSoup(html, "html.parser")
     form = soup.find("form")
     if not form:
@@ -154,13 +157,13 @@ def build_login_request(html):
             continue
         lname = name.lower()
         if itype == "password":
-            payload[name] = PASSWORD
+            payload[name] = password
         elif itype == "hidden":
             payload[name] = inp.get("value", "")
         elif any(k in lname for k in ("capt", "answer", "math")):
             payload[name] = str(captcha)
         elif not username_set:
-            payload[name] = USERNAME
+            payload[name] = username
             username_set = True
         else:
             payload[name] = str(captcha)
@@ -189,7 +192,7 @@ def login_to_portal(session, username, password):
         if response.status_code != 200:
             print("Failed to load login page")
             return False
-        action, payload = build_login_request(response.text)
+        action, payload = build_login_request(response.text, username, password)
         if not payload:
             print("Could not read login form or solve the math CAPTCHA")
             return False
