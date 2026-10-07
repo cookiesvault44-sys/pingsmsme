@@ -351,6 +351,7 @@ PAYOUT_RATES = {
     "Philippines": 1.7,
     "Algeria": 2.5,
     "Pakistan": 1.7,
+    "Tanzania": 4.0,
 }
 
 # Route codes the portal uses, mapped to countries (labels vary wildly, e.g.
@@ -358,6 +359,7 @@ PAYOUT_RATES = {
 ROUTE_CODE_COUNTRY = {
     "m406": "Palestine",
     "m606": "Palestine",
+    "taznia": "Tanzania",   # common misspelling of Tanzania in route labels
 }
 
 def country_of(cells, number):
@@ -382,11 +384,13 @@ def country_of(cells, number):
             return "Algeria"
         if number.startswith("+92"):
             return "Pakistan"
+        if number.startswith("+255"):
+            return "Tanzania"
     return "Other"
 
 def split_number(n):
     """'+972569290973' -> ('+972', '569290973'). Variable-length country codes."""
-    for cc in ("+972", "+970", "+63", "+213", "+92"):
+    for cc in ("+972", "+970", "+63", "+213", "+92", "+255"):
         if n.startswith(cc):
             return cc, n[len(cc):]
     m = re.match(r"(\+\d{1,4})", n or "")
@@ -448,6 +452,8 @@ def row_matches_phone(cells, target):
                 token = token[2:]
             elif token.startswith("92") and len(token) >= 12:
                 token = token[2:]
+            elif token.startswith("255") and len(token) >= 12:
+                token = token[3:]
             elif token.startswith("0") and len(token) >= 11:
                 token = token[1:]
             token = token[-10:]
@@ -606,7 +612,7 @@ def mark_seen():
 
 # ---------------------------------------------------------------- STATS (floating panel)
 def extract_number(cells):
-    """Find the phone number cell -> '+<country><national>' (972/970, 63, 213, 92 ...)."""
+    """Find the phone number cell -> '+<country><national>' (972/970, 63, 213, 92, 255 ...)."""
     for cell in cells:
         token = re.sub(r"[\s+\-().]", "", cell)
         if not re.fullmatch(r"[\d*xX#]{9,15}", token):
@@ -621,6 +627,8 @@ def extract_number(cells):
             return "+213" + token[3:]
         if token.startswith("92") and len(token) >= 11:
             return "+92" + token[2:]
+        if token.startswith("255") and len(token) >= 12:
+            return "+255" + token[3:]
         if token.startswith("0") and len(token) >= 10:
             return "+63" + token[1:]   # local format -> Philippines (portal default)
         return "+" + token
@@ -670,7 +678,7 @@ def compute_stats(rows, alnum=False, filters=None):
             "number": n,
             "country_code": cc,          # +972 / +63 / +213 ...
             "local": local,              # number without country code
-            "country": top_country,      # Palestine / Philippines / Algeria / Pakistan ...
+            "country": top_country,      # Palestine / Philippines / Algeria / Pakistan / Tanzania ...
             "otp_count": len(otps),
             "last_otp": otps[0]["otp"] if otps else None,
             "last_otp_time": otps[0]["time"] if otps else "",
