@@ -947,11 +947,16 @@ def fetch_all_numbers(username, password, s_search="", page_size=500, max_pages=
         if len(rows) < page_size:
             break
         start += page_size
-    _numbers_cache[key] = (datetime.now().timestamp(), all_rows)
+    if all_rows:
+        _numbers_cache[key] = (datetime.now().timestamp(), all_rows)
     print(f"[numbers] fetched {len(all_rows)} rows (search={s_search!r})")
     return all_rows
 
 PHONE_CELL_RE = re.compile(r"^\+?\d{7,15}$")
+
+def norm_label(s):
+    """'Sri Lanka-M2-02' -> 'srilankam202' (forgiving range comparison)."""
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
 
 def parse_number_row(row):
     """A numbers-table row -> {"number": "213...", "range": "Algeria-M4-04"}.
@@ -970,6 +975,15 @@ def parse_number_row(row):
         if rng is None and "-" in t and len(t) < 60 and not PHONE_CELL_RE.match(t) \
                 and not TIMESTAMP_RE.search(t):
             rng = t
+    if number is None:
+        # fallback: hunt for any long digit run in the row text (oddly
+        # formatted number cells, e.g. "94771 234 567 (active)")
+        for cell in row:
+            t = re.sub(r"<[^>]+>", "", str(cell)).replace(" ", "")
+            m = re.search(r"\+?\d{7,15}", t)
+            if m:
+                number = m.group(0)
+                break
     return {"number": number, "range": rng}
 
 @app.route("/ranges", methods=["GET"])
@@ -1001,20 +1015,37 @@ def numbers():
     if rows is None:
         return jsonify({"error": "Failed to log into SMS portal"}), 500
     parsed = [parse_number_row(r) for r in rows]
-    server_filtered = True
+    debug = {}
     if want:
         # verify locally when rows carry a range column (robust even if the
-        # portal ignored sSearch); otherwise trust the server-side filter
-        if any(p["range"] for p in parsed):
-            parsed = [p for p in parsed if (p["range"] or "").lower() == want.lower()]
-            server_filtered = False
+        # portal ignored sSearch); otherwise trust the server-side filter.
+        # Comparison is fuzzy: case/space/dash differences are ignored, with
+        # a substring fallback ("SriLanka" vs "Sri Lanka").
+        want_n = norm_label(want)
+        seen = sorted({p["range"] for p in parsed if p["range"]})
+        if seen:
+            matched = [p for p in parsed if norm_label(p["range"]) == want_n]
+            if not matched:
+                matched = [p for p in parsed
+                           if norm_label(p["range"]) and
+                           (want_n in norm_label(p["range"]) or norm_label(p["range"]) in want_n)]
+            parsed = matched
+            debug = {"ranges_seen": seen[:12], "raw_rows": len(rows)}
     nums = [p["number"] for p in parsed if p["number"]]
-    return jsonify({
+    resp = {
         "range": want,
         "numbers": nums,
         "total": len(nums),
         "portal_user": username,
-    }), 200
+    }
+    if not nums:
+        # tell the extension (and us) what the portal actually returned, so a
+        # "no numbers" report is actionable instead of a dead end
+        debug["raw_rows"] = debug.get("raw_rows", len(rows))
+        if rows:
+            debug["sample_row"] = [re.sub(r"<[^>]+>", "", str(c)).strip()[:40] for c in rows[0][:6]]
+        resp["debug"] = debug
+    return jsonify(resp), 200
 
 if __name__ == "__main__":
     # If the saved username/password turn out to be wrong, delete the bad
