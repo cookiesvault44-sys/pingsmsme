@@ -874,6 +874,21 @@ def discover_numbers_ajax(html):
             return urljoin(MYNUMBERS_URL, m.group(1).strip())
     return None
 
+def discover_numbers_ajax_candidates(html):
+    """EVERY plausible DataTables AJAX URL (the page may host several tables;
+    the first regex hit is not necessarily the numbers table)."""
+    cands = []
+    for rx in _NUMBERS_AJAX_RES:
+        for m in rx.finditer(html):
+            u = urljoin(MYNUMBERS_URL, m.group(1).strip())
+            if u not in cands:
+                cands.append(u)
+    for m in re.finditer(r"""data-ajax=['"]([^'"]+)['"]""", html):
+        u = urljoin(MYNUMBERS_URL, m.group(1).strip())
+        if u not in cands:
+            cands.append(u)
+    return cands
+
 def get_numbers_ajax_url(username, password, html=None):
     """Discovered numbers AJAX url for this user (cached 30 min)."""
     entry = _numbers_ajax_url.get(username)
@@ -891,7 +906,8 @@ def get_numbers_ajax_url(username, password, html=None):
     return url
 
 def fetch_numbers_page(username, password, ajax_url, s_search="", start=0, length=500):
-    """One page of number rows from the portal. Returns (rows, total) or (None, None)."""
+    """One page of number rows. Returns (rows, total) or (None, None).
+    Tries GET first, then POST (some portals only accept POST for DataTables)."""
     headers = {
         "X-Requested-With": "XMLHttpRequest",
         "Referer": MYNUMBERS_URL,
@@ -906,51 +922,99 @@ def fetch_numbers_page(username, password, ajax_url, s_search="", start=0, lengt
     }
     session = get_session(username)
     with portal_lock:
-        for attempt in range(3):
-            try:
-                session.get(MYNUMBERS_URL, timeout=10)  # warm up session cookies
-                r = session.get(ajax_url, params=params, headers=headers, timeout=20)
-                if "login" in r.url.lower() or r.text.strip().startswith("<"):
-                    raise ValueError("login wall / not JSON")
-                data = r.json()
-                rows = data.get("aaData", data.get("data", []))
-                total = data.get("iTotalRecords", data.get("recordsTotal", len(rows)))
-                return rows, total
-            except Exception as e:
-                print(f"[numbers] ajax fetch failed (attempt {attempt + 1}): {e}")
-                if attempt < 2:
-                    if not login_to_portal(session, username, password):
-                        return None, None
-                else:
-                    return None, None
+        for method in ("get", "post"):
+            for attempt in range(2):
+                try:
+                    session.get(MYNUMBERS_URL, timeout=10)  # warm up session cookies
+                    if method == "post":
+                        r = session.post(ajax_url, data=params, headers=headers, timeout=20)
+                    else:
+                        r = session.get(ajax_url, params=params, headers=headers, timeout=20)
+                    if "login" in r.url.lower() or r.text.strip().startswith("<"):
+                        raise ValueError("login wall / not JSON")
+                    data = r.json()
+                    rows = data.get("aaData", data.get("data", []))
+                    total = data.get("iTotalRecords", data.get("recordsTotal", len(rows)))
+                    return rows, total
+                except Exception as e:
+                    print(f"[numbers] ajax {method} failed (attempt {attempt + 1}): {e}")
+                    if attempt == 0:
+                        if not login_to_portal(session, username, password):
+                            break
     return None, None
 
-def fetch_all_numbers(username, password, s_search="", page_size=500, max_pages=40):
-    """Every number row (paginated). s_search pre-filters server-side when the
-    portal honors DataTables global search; callers also filter locally."""
-    key = (username, s_search)
-    entry = _numbers_cache.get(key)
-    if entry and entry[0] > datetime.now().timestamp() - 300:
-        return entry[1]
-    ajax_url = get_numbers_ajax_url(username, password)
-    if not ajax_url:
-        return None
+def fetch_candidate_rows(username, password, ajax_url, s_search, page_size, max_pages):
+    """Paginate a single AJAX endpoint. Returns (rows, ok)."""
     all_rows = []
     start = 0
     for _ in range(max_pages):
         rows, total = fetch_numbers_page(username, password, ajax_url, s_search, start, page_size)
         if rows is None:
-            return None
+            return None, False
         if not rows:
             break
         all_rows.extend(rows)
         if len(rows) < page_size:
             break
         start += page_size
-    if all_rows:
-        _numbers_cache[key] = (datetime.now().timestamp(), all_rows)
-    print(f"[numbers] fetched {len(all_rows)} rows (search={s_search!r})")
-    return all_rows
+    return all_rows, True
+
+DATE_LIKE_RE = re.compile(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}")
+
+def _looks_like_date(t):
+    return bool(TIMESTAMP_RE.search(t) or DATE_LIKE_RE.search(t))
+
+def has_phone_number(row):
+    """True if any cell of the row looks like a phone number (loose check)."""
+    for cell in row:
+        t = re.sub(r"<[^>]+>", "", str(cell)).strip().replace(" ", "")
+        if PHONE_CELL_RE.match(t):
+            return True
+    for cell in row:
+        t = re.sub(r"<[^>]+>", "", str(cell)).strip()
+        if _looks_like_date(t):
+            continue
+        cleaned = ("+" if t.startswith("+") else "") + re.sub(r"\D", "", t)
+        if PHONE_CELL_RE.match(cleaned):
+            return True
+    return False
+
+def fetch_all_numbers(username, password, s_search="", page_size=500, max_pages=40):
+    """Every number row (paginated). Returns (rows, debug).
+
+    s_search pre-filters server-side when the portal honors DataTables global
+    search; callers also filter locally. Every discovered AJAX endpoint is
+    tried; the first whose rows actually contain phone numbers wins (the page
+    may host several DataTables and the first regex hit is often the wrong one).
+    """
+    key = (username, s_search)
+    entry = _numbers_cache.get(key)
+    if entry and entry[0] > datetime.now().timestamp() - 300:
+        return entry[1], {}
+    html = fetch_mynumbers_html(username, password)
+    if html is None:
+        return None, {"error": "login_failed"}
+    cands = discover_numbers_ajax_candidates(html)
+    preferred = get_numbers_ajax_url(username, password, html=html)
+    if preferred and preferred in cands:
+        cands.remove(preferred)
+        cands.insert(0, preferred)
+    elif preferred and preferred not in cands:
+        cands.insert(0, preferred)
+    debug = {"ajax_candidates": len(cands)}
+    tried = []
+    for ajax_url in cands:
+        all_rows, ok = fetch_candidate_rows(username, password, ajax_url, s_search, page_size, max_pages)
+        phones = sum(1 for r in (all_rows or []) if has_phone_number(r))
+        tried.append({"url": ajax_url[-70:], "rows": len(all_rows or []), "phones": phones})
+        if ok and all_rows and phones:
+            _numbers_cache[key] = (datetime.now().timestamp(), all_rows)
+            print(f"[numbers] using {ajax_url}: {len(all_rows)} rows, "
+                  f"{phones} with phones (search={s_search!r})")
+            return all_rows, {}
+    debug["tried"] = tried
+    print(f"[numbers] no candidate yielded phone numbers (search={s_search!r})")
+    return [], debug
 
 PHONE_CELL_RE = re.compile(r"^\+?\d{7,15}$")
 
@@ -976,13 +1040,15 @@ def parse_number_row(row):
                 and not TIMESTAMP_RE.search(t):
             rng = t
     if number is None:
-        # fallback: hunt for any long digit run in the row text (oddly
-        # formatted number cells, e.g. "94771 234 567 (active)")
+        # fallback: strip everything but digits (handles "94-77-123-4567",
+        # "94771 234 569 (active)"); skip date-like cells
         for cell in row:
-            t = re.sub(r"<[^>]+>", "", str(cell)).replace(" ", "")
-            m = re.search(r"\+?\d{7,15}", t)
-            if m:
-                number = m.group(0)
+            t = re.sub(r"<[^>]+>", "", str(cell)).strip()
+            if _looks_like_date(t):
+                continue
+            cleaned = ("+" if t.startswith("+") else "") + re.sub(r"\D", "", t)
+            if PHONE_CELL_RE.match(cleaned):
+                number = cleaned
                 break
     return {"number": number, "range": rng}
 
@@ -999,7 +1065,8 @@ def ranges():
     labels = parse_ranges(html)
     if not labels:
         # fallback: distinct ranges seen in the numbers data itself
-        rows = fetch_all_numbers(username, password) or []
+        rows, _dbg = fetch_all_numbers(username, password)
+        rows = rows or []
         labels = sorted({p["range"] for p in (parse_number_row(r) for r in rows) if p["range"]})
     return jsonify({"ranges": labels, "portal_user": username}), 200
 
@@ -1011,11 +1078,11 @@ def numbers():
         return err
     username, password = creds
     want = (request.args.get("range") or "").strip()
-    rows = fetch_all_numbers(username, password, s_search=want)
+    rows, fetch_dbg = fetch_all_numbers(username, password, s_search=want)
     if rows is None:
         return jsonify({"error": "Failed to log into SMS portal"}), 500
     parsed = [parse_number_row(r) for r in rows]
-    debug = {}
+    debug = dict(fetch_dbg)
     if want:
         # verify locally when rows carry a range column (robust even if the
         # portal ignored sSearch); otherwise trust the server-side filter.
