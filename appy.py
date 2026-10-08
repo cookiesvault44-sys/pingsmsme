@@ -1081,6 +1081,16 @@ def numbers():
     rows, fetch_dbg = fetch_all_numbers(username, password, s_search=want)
     if rows is None:
         return jsonify({"error": "Failed to log into SMS portal"}), 500
+    if want and not rows:
+        # The portal's server-side search didn't match our range label
+        # (e.g. "SaudiArabia-mix-01"); fetch everything and filter locally
+        # with the forgiving matcher instead.
+        rows_all, dbg_all = fetch_all_numbers(username, password, s_search="")
+        if rows_all:
+            rows, fetch_dbg = rows_all, dbg_all
+            fetch_dbg["ssearch_fallback"] = True
+            print(f"[numbers] sSearch found nothing; falling back to full fetch "
+                  f"({len(rows_all)} rows) for {want!r}")
     parsed = [parse_number_row(r) for r in rows]
     debug = dict(fetch_dbg)
     if want:
