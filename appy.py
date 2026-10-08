@@ -816,7 +816,7 @@ def payout():
 # labels (e.g. "Algeria-M4-04", "Angola-M3-04") and a server-side DataTables
 # grid of the numbers. The extension mirrors it: pick a range, see its
 # numbers, copy them.
-MYNUMBERS_URL = f"{PORTAL_BASE_URL}/client/MyNumbers"
+MYNUMBERS_URL = f"{PORTAL_BASE_URL}/client/MySMSNumbers"
 
 _numbers_ajax_url = {}   # username -> ajax url (discovered from page JS)
 _numbers_cache = {}      # username -> (timestamp, rows)
