@@ -811,6 +811,211 @@ def payout():
                                       key=lambda kv: -kv[1])[:10]),
     }), 200
 
+# ---------------------------------------------------------------- MY NUMBERS (ranges + numbers)
+# The portal's "My Numbers" page (client/MyNumbers) has a <select> of range
+# labels (e.g. "Algeria-M4-04", "Angola-M3-04") and a server-side DataTables
+# grid of the numbers. The extension mirrors it: pick a range, see its
+# numbers, copy them.
+MYNUMBERS_URL = f"{PORTAL_BASE_URL}/client/MyNumbers"
+
+_numbers_ajax_url = {}   # username -> ajax url (discovered from page JS)
+_numbers_cache = {}      # username -> (timestamp, rows)
+
+def fetch_mynumbers_html(username, password):
+    """GET the My Numbers page HTML with the user's portal session.
+
+    Re-logs in when the session expired. Returns the HTML string, or None.
+    """
+    session = get_session(username)
+    with portal_lock:
+        for attempt in range(3):
+            try:
+                r = session.get(MYNUMBERS_URL, timeout=15)
+                if r.status_code in (401, 403) or "login" in r.url.lower():
+                    raise ValueError("login wall")
+                if BeautifulSoup(r.text, "html.parser").find("input", {"type": "password"}):
+                    raise ValueError("login wall")
+                return r.text
+            except Exception as e:
+                print(f"[numbers] page fetch failed (attempt {attempt + 1}): {e}")
+                if attempt < 2:
+                    if not login_to_portal(session, username, password):
+                        return None
+                else:
+                    return None
+    return None
+
+def parse_ranges(html):
+    """Range labels from the page's <select> (what the user sees in the portal)."""
+    soup = BeautifulSoup(html, "html.parser")
+    best = []
+    for sel in soup.find_all("select"):
+        opts = []
+        for o in sel.find_all("option"):
+            t = o.get_text(strip=True)
+            if not t or t.lower() in ("select range", "all", "--", "---", "select"):
+                continue
+            opts.append(t)
+        # the range selector is the one with several dash-separated labels
+        if len(opts) >= 2 and sum(1 for o in opts if "-" in o) >= 2 and len(opts) > len(best):
+            best = opts
+    return best
+
+_NUMBERS_AJAX_RES = [
+    re.compile(r"""['"]ajax['"]\s*:\s*['"]([^'"]+)['"]"""),
+    re.compile(r"""sAjaxSource['"]?\s*[:=]\s*['"]([^'"]+)['"]"""),
+]
+
+def discover_numbers_ajax(html):
+    """Find the numbers DataTables AJAX endpoint inside the page's JavaScript."""
+    for rx in _NUMBERS_AJAX_RES:
+        m = rx.search(html)
+        if m:
+            return urljoin(MYNUMBERS_URL, m.group(1).strip())
+    return None
+
+def get_numbers_ajax_url(username, password, html=None):
+    """Discovered numbers AJAX url for this user (cached 30 min)."""
+    entry = _numbers_ajax_url.get(username)
+    if entry and entry[0] > datetime.now().timestamp() - 1800:
+        return entry[1]
+    html = html or fetch_mynumbers_html(username, password)
+    if not html:
+        return None
+    url = discover_numbers_ajax(html)
+    if url:
+        _numbers_ajax_url[username] = (datetime.now().timestamp(), url)
+        print(f"[numbers] ajax url: {url}")
+    else:
+        print("[numbers] WARNING: could not discover numbers AJAX url from page JS")
+    return url
+
+def fetch_numbers_page(username, password, ajax_url, s_search="", start=0, length=500):
+    """One page of number rows from the portal. Returns (rows, total) or (None, None)."""
+    headers = {
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": MYNUMBERS_URL,
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+    }
+    params = {
+        "sEcho": 1,
+        "iDisplayStart": start, "iDisplayLength": length,
+        "sSearch": s_search or "", "bRegex": "false",
+        "iSortCol_0": 0, "sSortDir_0": "asc", "iSortingCols": 1,
+        "_": int(datetime.now().timestamp() * 1000),
+    }
+    session = get_session(username)
+    with portal_lock:
+        for attempt in range(3):
+            try:
+                session.get(MYNUMBERS_URL, timeout=10)  # warm up session cookies
+                r = session.get(ajax_url, params=params, headers=headers, timeout=20)
+                if "login" in r.url.lower() or r.text.strip().startswith("<"):
+                    raise ValueError("login wall / not JSON")
+                data = r.json()
+                rows = data.get("aaData", data.get("data", []))
+                total = data.get("iTotalRecords", data.get("recordsTotal", len(rows)))
+                return rows, total
+            except Exception as e:
+                print(f"[numbers] ajax fetch failed (attempt {attempt + 1}): {e}")
+                if attempt < 2:
+                    if not login_to_portal(session, username, password):
+                        return None, None
+                else:
+                    return None, None
+    return None, None
+
+def fetch_all_numbers(username, password, s_search="", page_size=500, max_pages=40):
+    """Every number row (paginated). s_search pre-filters server-side when the
+    portal honors DataTables global search; callers also filter locally."""
+    key = (username, s_search)
+    entry = _numbers_cache.get(key)
+    if entry and entry[0] > datetime.now().timestamp() - 300:
+        return entry[1]
+    ajax_url = get_numbers_ajax_url(username, password)
+    if not ajax_url:
+        return None
+    all_rows = []
+    start = 0
+    for _ in range(max_pages):
+        rows, total = fetch_numbers_page(username, password, ajax_url, s_search, start, page_size)
+        if rows is None:
+            return None
+        if not rows:
+            break
+        all_rows.extend(rows)
+        if len(rows) < page_size:
+            break
+        start += page_size
+    _numbers_cache[key] = (datetime.now().timestamp(), all_rows)
+    print(f"[numbers] fetched {len(all_rows)} rows (search={s_search!r})")
+    return all_rows
+
+PHONE_CELL_RE = re.compile(r"^\+?\d{7,15}$")
+
+def parse_number_row(row):
+    """A numbers-table row -> {"number": "213...", "range": "Algeria-M4-04"}.
+
+    Cells may carry HTML (checkboxes etc.); the number is the phone-like cell,
+    the range is the dash-separated label cell that is not a date/number.
+    """
+    number, rng = None, None
+    for cell in row:
+        t = re.sub(r"<[^>]+>", "", str(cell)).strip().replace(" ", "")
+        if not t:
+            continue
+        if number is None and PHONE_CELL_RE.match(t):
+            number = t
+            continue
+        if rng is None and "-" in t and len(t) < 60 and not PHONE_CELL_RE.match(t) \
+                and not TIMESTAMP_RE.search(t):
+            rng = t
+    return {"number": number, "range": rng}
+
+@app.route("/ranges", methods=["GET"])
+def ranges():
+    """Range labels available in the user's portal (from the My Numbers page)."""
+    creds, err = require_login()
+    if err:
+        return err
+    username, password = creds
+    html = fetch_mynumbers_html(username, password)
+    if html is None:
+        return jsonify({"error": "Failed to log into SMS portal"}), 500
+    labels = parse_ranges(html)
+    if not labels:
+        # fallback: distinct ranges seen in the numbers data itself
+        rows = fetch_all_numbers(username, password) or []
+        labels = sorted({p["range"] for p in (parse_number_row(r) for r in rows) if p["range"]})
+    return jsonify({"ranges": labels, "portal_user": username}), 200
+
+@app.route("/numbers", methods=["GET"])
+def numbers():
+    """Numbers of one range: /numbers?range=Algeria-M4-04 -> {"numbers": [...]}."""
+    creds, err = require_login()
+    if err:
+        return err
+    username, password = creds
+    want = (request.args.get("range") or "").strip()
+    rows = fetch_all_numbers(username, password, s_search=want)
+    if rows is None:
+        return jsonify({"error": "Failed to log into SMS portal"}), 500
+    parsed = [parse_number_row(r) for r in rows]
+    server_filtered = True
+    if want:
+        # verify locally when rows carry a range column (robust even if the
+        # portal ignored sSearch); otherwise trust the server-side filter
+        if any(p["range"] for p in parsed):
+            parsed = [p for p in parsed if (p["range"] or "").lower() == want.lower()]
+            server_filtered = False
+    nums = [p["number"] for p in parsed if p["number"]]
+    return jsonify({
+        "range": want,
+        "numbers": nums,
+        "total": len(nums),
+        "portal_user": username,
+    }), 200
+
 if __name__ == "__main__":
     # If the saved username/password turn out to be wrong, delete the bad
     # login.json and ask again (3 tries), instead of starting with dead creds.
